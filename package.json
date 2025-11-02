@@ -76,13 +76,15 @@
         }
       ]
     }
-  },
-  "scripts": {
-    "vscode:prepublish": "npm run build",
+  },  "scripts": {
     "build": "tsc -p ./",
     "watch": "tsc -w -p ./",
     "lint": "eslint src",
-    "test": "vscode-test"
+    "test": "npm run test:unit && npm run test:e2e",
+    "test:unit": "vitest run --config vitest.config.mjs",
+    "test:unit:watch": "vitest --config vitest.config.mjs",
+    "test:e2e": "tsc -p tsconfig.e2e.json && node ./out/test/e2e/runTest.js",
+    "vscode:prepublish": "npm run build"
   },
   "devDependencies": {
     "@types/mocha": "^10.0.10",
@@ -94,6 +96,7 @@
     "@vscode/test-electron": "^2.5.2",
     "eslint": "^9.36.0",
     "tslib": "^2.6.2",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "vitest": "^2.1.5"
   }
 }

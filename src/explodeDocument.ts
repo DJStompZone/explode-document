@@ -26,37 +26,48 @@ import * as vscode from "vscode";
  * isTopLevelDeclaration(node, sourceFile);
  */
 
-export function isTopLevelDeclaration(
-  node: ts.Node,
-  sourceFile: ts.SourceFile
-): boolean {
-  const isTop = (n: ts.Node) => node.parent === sourceFile;
-  if (!isTop(node)) {
-    return false;
-  }
+let channel: vscode.OutputChannel | undefined;
+
+/** Get a shared output channel for the extension. */
+function out(): vscode.OutputChannel {
+  if (!channel) {channel = vscode.window.createOutputChannel("Explode Document");}
+  return channel;
+}
+
+/** Append a timestamped line to the output channel and console.debug. */
+function log(msg: string): void {
+  const ts = new Date().toISOString();
+  const line = `[${ts}] ${msg}`;
+  out().appendLine(line);
+   
+  console.debug(line);
+}
+
+/** Sleep helper to avoid racing the TS Server or FS in headless runs. */
+const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
+
+/**
+ * Determines whether a given TypeScript AST node is a top-level declaration within the provided source file.
+ * Supported decls: class, interface, enum, function, type alias, and block-scoped variable statements (const or let).
+ */
+export function isTopLevelDeclaration(node: ts.Node, sourceFile: ts.SourceFile): boolean {
+  if (node.parent !== sourceFile) {return false;}
   if (
     ts.isClassDeclaration(node) ||
     ts.isInterfaceDeclaration(node) ||
     ts.isEnumDeclaration(node) ||
     ts.isFunctionDeclaration(node) ||
     ts.isTypeAliasDeclaration(node)
-  ) {
-    return true;
-  }
+  ) {return true;}
   if (ts.isVariableStatement(node)) {
-    const declList = node.declarationList;
-    const isBlockScoped =
-      (declList.flags & ts.NodeFlags.BlockScoped) !== 0 ||
-      (declList.flags & ts.NodeFlags.Const) !== 0 ||
-      (declList.flags & ts.NodeFlags.Let) !== 0;
-    if (isBlockScoped && declList.declarations.length > 0) {
-      return true;
-    }
+    const flags = node.declarationList.flags;
+    const block = (flags & ts.NodeFlags.Const) !== 0 || (flags & ts.NodeFlags.Let) !== 0 || (flags & ts.NodeFlags.BlockScoped) !== 0;
+    return block && node.declarationList.declarations.length > 0;
   }
   return false;
 }
 
-function checkDocumentLanguage(doc: vscode.TextDocument): boolean {
+function isTSLike(doc: vscode.TextDocument): boolean {
   return (
     doc.languageId === "typescript" ||
     doc.languageId === "typescriptreact" ||
@@ -65,144 +76,194 @@ function checkDocumentLanguage(doc: vscode.TextDocument): boolean {
   );
 }
 
-export async function explodeDocument() {
+/** Try to ensure the built-in TS extension and TS Server are awake. */
+async function waitForTypeScriptReady(doc: vscode.TextDocument): Promise<void> {
+  const tsExt = vscode.extensions.getExtension("vscode.typescript-language-features");
+  if (!tsExt) {
+    log("TypeScript extension vscode.typescript-language-features not found");
+  } else {
+    log(`Activating TypeScript extension ${tsExt.id}`);
+    try {
+      await tsExt.activate();
+      log("TypeScript extension activated");
+    } catch (e) {
+      log(`TypeScript extension activation error: ${(e as Error).message}`);
+    }
+  }
+
+  // Nudge TS by asking for diagnostics a few times
+  for (let i = 0; i < 20; i++) {
+    const diags = vscode.languages.getDiagnostics(doc.uri);
+    if (diags !== undefined) {
+      log(`Diagnostics check ${i + 1} ok for ${doc.uri.fsPath}`);
+      return;
+    }
+    await sleep(100);
+  }
+  log("Warning: diagnostics ping loop ended without confirmation");
+}
+
+/** Query the provider API for move-to-new-file code actions. Falls back to any-kinds and filters. */
+async function queryMoveNewFileActions(doc: vscode.TextDocument, sel: vscode.Selection): Promise<vscode.CodeAction[]> {
+  const KIND = "refactor.move.newFile";
+
+  // Try strict kind string first
+  try {
+    log(`Query provider with kind ${KIND} at ${sel.start.line}:${sel.start.character}-${sel.end.line}:${sel.end.character}`);
+    const a = (await vscode.commands.executeCommand<vscode.CodeAction[]>("vscode.executeCodeActionProvider", doc.uri, sel, KIND)) || [];
+    const filtered = a.filter(x => x.kind && vscode.CodeActionKind.RefactorMove.append("newFile").contains(x.kind));
+    log(`Provider returned ${a.length} actions, filtered to ${filtered.length} by kind`);
+    if (filtered.length) {return filtered;}
+  } catch (e) {
+    log(`Provider kind query rejected: ${(e as Error).message}`);
+  }
+
+  // Fallback: no kind, filter manually
+  log("Query provider without kind and filter client-side");
+  const any = (await vscode.commands.executeCommand<vscode.CodeAction[]>("vscode.executeCodeActionProvider", doc.uri, sel)) || [];
+  const filtered = any.filter(
+    x => (x.kind && vscode.CodeActionKind.RefactorMove.append("newFile").contains(x.kind)) || /Move to a new file/i.test(x.title ?? "")
+  );
+  log(`Provider no-kind returned ${any.length} actions, filtered to ${filtered.length}`);
+  return filtered;
+}
+
+/** Directly ask VS Code to run the first matching code action for a given kind. */
+async function executeEditorCodeAction(kind: string): Promise<boolean> {
+  try {
+    log(`Invoke editor.action.codeAction with kind ${kind} and apply first`);
+    await vscode.commands.executeCommand("editor.action.codeAction", { kind, apply: "first", preferred: false });
+    return true;
+  } catch (e) {
+    log(`editor.action.codeAction failed: ${(e as Error).message}`);
+    return false;
+  }
+}
+
+export async function explodeDocument(): Promise<void> {
+  out().show(true);
+  log("==== Explode Document invoked ====");
+
   const editor = vscode.window.activeTextEditor;
   if (!editor) {
-    void vscode.window.showErrorMessage("Explode Document: No active editor.");
+    const msg = "Explode Document: No active editor";
+    log(msg);
+    void vscode.window.showErrorMessage(msg);
     return;
   }
 
   const doc = editor.document;
-  const ok = checkDocumentLanguage(doc);
-  if (!ok) {
-    void vscode.window.showErrorMessage("Explode Document: TS/JS files only.");
+  log(`Active document ${doc.uri.fsPath} lang=${doc.languageId}`);
+
+  if (!isTSLike(doc)) {
+    const msg = "Explode Document: TS or JS files only";
+    log(msg);
+    void vscode.window.showErrorMessage(msg);
     return;
   }
 
+  await waitForTypeScriptReady(doc);
+
   const text = doc.getText();
-  const sf = ts.createSourceFile(
-    doc.fileName,
-    text,
-    ts.ScriptTarget.Latest,
-    true
-  );
+  const sf = ts.createSourceFile(doc.fileName, text, ts.ScriptTarget.Latest, true);
 
-  // Collect target ranges at the name span of each top-level declaration.
-  const nameRanges: vscode.Range[] = [];
-  const isTop = (n: ts.Node) => n.parent === sf;
+  type Target = { start: number; end: number; label: string; kind: string };
+  const targets: Target[] = [];
 
-  const pushNameRange = (start: number, end: number) => {
-    nameRanges.push(
-      new vscode.Range(doc.positionAt(start), doc.positionAt(end))
-    );
-  };
+  function push(start: number, end: number, label: string, kind: string): void {
+    targets.push({ start, end, label, kind });
+  }
 
   function visit(n: ts.Node): void {
-    if (!isTop(n)) {
-      ts.forEachChild(n, visit);
-      return;
-    }
-
     if (!isTopLevelDeclaration(n, sf)) {
       ts.forEachChild(n, visit);
       return;
-    } else if (!ts.isVariableStatement(n)) {
-      // Prefer the identifier only (tight name span) if present; else the whole node.
-      const id = (
-        n as
-          | ts.ClassDeclaration
-          | ts.InterfaceDeclaration
-          | ts.EnumDeclaration
-          | ts.FunctionDeclaration
-          | ts.TypeAliasDeclaration
-      ).name;
-      if (id) {
-        pushNameRange(id.getStart(sf, true), id.getEnd());
-      } else {
-        pushNameRange(n.getStart(sf, true), n.getEnd());
-      }
+    }
+
+    if (!ts.isVariableStatement(n)) {
+      const named = n as ts.ClassDeclaration | ts.InterfaceDeclaration | ts.EnumDeclaration | ts.FunctionDeclaration | ts.TypeAliasDeclaration;
+      const id = named.name;
+      const label = id ? id.getText(sf) : "<anonymous>";
+      push(id ? id.getStart(sf, true) : n.getStart(sf, true), id ? id.getEnd() : n.getEnd(), label, ts.SyntaxKind[n.kind]);
     } else {
-      const declList = n.declarationList;
-      const isBlockScoped =
-        (declList.flags & ts.NodeFlags.BlockScoped) !== 0 ||
-        (declList.flags & ts.NodeFlags.Const) !== 0 ||
-        (declList.flags & ts.NodeFlags.Let) !== 0;
-      if (isBlockScoped && declList.declarations.length > 0) {
-        const first = declList.declarations[0];
+      const first = n.declarationList.declarations[0];
+      if (first) {
         if (ts.isIdentifier(first.name)) {
-          pushNameRange(first.name.getStart(sf, true), first.name.getEnd());
+          push(first.name.getStart(sf, true), first.name.getEnd(), first.name.text, "Variable");
         } else {
-          pushNameRange(first.getStart(sf, true), first.getEnd());
+          push(first.getStart(sf, true), first.getEnd(), "<var>", "Variable");
         }
       }
     }
   }
-  visit(sf);
 
-  if (nameRanges.length === 0) {
-    void vscode.window.showInformationMessage(
-      "Explode Document: No top-level declarations found."
-    );
+  ts.forEachChild(sf, visit);
+
+  if (targets.length === 0) {
+    const msg = "Explode Document: No top-level declarations found";
+    log(msg);
+    void vscode.window.showInformationMessage(msg);
     return;
   }
 
-  const MOVE_NEWFILE_KIND =
-    vscode.CodeActionKind.RefactorMove.append("newFile").value;
+  // Bottom to top to avoid offset drift
+  targets.sort((a, b) => b.start - a.start);
+
+  log(`Found ${targets.length} top-level decls`);
+  targets.forEach((t, i) => {
+    const s = doc.positionAt(t.start);
+    const e = doc.positionAt(t.end);
+    log(`Decl ${i + 1}/${targets.length} label=${t.label} kind=${t.kind} range=${s.line}:${s.character}-${e.line}:${e.character}`);
+  });
 
   await vscode.window.withProgress(
-    {
-      location: vscode.ProgressLocation.Notification,
-      title: "Explode Document: Move each decl to a new file",
-      cancellable: false,
-    },
-    async (progress) => {
+    { location: vscode.ProgressLocation.Notification, title: "Explode Document running", cancellable: false },
+    async progress => {
       let done = 0;
-      for (const range of nameRanges) {
-        progress.report({
-          message: `Processing ${++done}/${nameRanges.length}`,
-        });
 
-        const actions =
-          (await vscode.commands.executeCommand<vscode.CodeAction[]>(
-            "vscode.executeCodeActionProvider",
-            doc.uri,
-            range,
-            MOVE_NEWFILE_KIND
-          )) || [];
+      for (const t of targets) {
+        const s = doc.positionAt(t.start);
+        const e = doc.positionAt(t.end);
+        const sel = new vscode.Selection(s, e);
+        editor.selection = sel;
+        editor.revealRange(new vscode.Range(s, e), vscode.TextEditorRevealType.InCenterIfOutsideViewport);
 
-        const candidates = actions.filter(
-          (a) =>
-            a.kind &&
-            vscode.CodeActionKind.RefactorMove.append("newFile").contains(
-              a.kind
-            )
-        );
+        progress.report({ message: `Processing ${++done}/${targets.length} ${t.label}` });
+        log(`Processing ${done}/${targets.length} label=${t.label} set selection and reveal`);
 
-        for (const action of candidates) {
-          try {
-            if (action.edit) {
-              await vscode.workspace.applyEdit(action.edit, {
-                isRefactoring: true,
-              });
-            }
-            if (action.command) {
-              await vscode.commands.executeCommand(
-                action.command.command,
-                ...(action.command.arguments ?? [])
-              );
-            }
-          } catch (err) {
-            const msg = err instanceof Error ? err.message : String(err);
-            void vscode.window.showWarningMessage(
-              `Explode Document: one declaration failed: ${msg}`
-            );
+        // Try provider path first and apply each by resolving via vscode.executeCodeAction
+        let usedProvider = false;
+        try {
+          const actions = await queryMoveNewFileActions(doc, sel);
+          log(`Provider path candidate count for ${t.label}: ${actions.length}`);
+          for (const action of actions) {
+            const kindStr = action.kind?.value ?? "(no kind)";
+            log(`Executing CodeAction via vscode.executeCodeAction title="${action.title}" kind="${kindStr}"`);
+            await vscode.commands.executeCommand("vscode.executeCodeAction", action);
+            usedProvider = true;
+            // Small pause for FS settle
+            await sleep(120);
+            break; // apply only the first matching “Move to a new file”
           }
+        } catch (e) {
+          log(`Provider execute failed for ${t.label}: ${(e as Error).message}`);
+        }
+
+        if (usedProvider) {continue;}
+
+        // Fallback path: generic codeAction executor
+        log(`No provider-executed action for ${t.label}. Fallback to editor.action.codeAction kind=refactor.move.newFile`);
+        const ok = await executeEditorCodeAction("refactor.move.newFile");
+        if (!ok) {
+          log(`Fallback codeAction executor did not apply for ${t.label}`);
+        } else {
+          log(`Fallback applied for ${t.label}`);
+          await sleep(150);
         }
       }
     }
   );
 
-  void vscode.window.showInformationMessage(
-    "Explode Document: Done. Sanity-check the results before committing."
-  );
+  log("Explode Document finished");
+  void vscode.window.showInformationMessage("Explode Document finished. See the Output panel for logs");
 }
