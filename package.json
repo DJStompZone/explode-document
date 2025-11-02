@@ -1,0 +1,99 @@
+{
+  "name": "explode-document",
+  "displayName": "Explode Document",
+  "description": "Split top-level declarations (classes, interfaces, functions, enums, const/let vars) in the current TS/JS document, each into its own new file using the built-in refactor.",
+  "version": "0.0.1",
+  "publisher": "djstomp",
+  "author": {
+    "name": "DJ Stomp",
+    "email": "85457381+DJStompZone@users.noreply.github.com",
+    "url": "https://github.com/DJStompZone"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/DJStompZone/explode-document.git"
+  },
+  "bugs": {
+    "url": "https://github.com/DJStompZone/explode-document/issues"
+  },
+  "homepage": "https://github.com/DJStompZone/explode-document",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.105.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Other"
+  ],
+  "keywords": [
+    "refactor",
+    "typescript",
+    "javascript",
+    "move to new file",
+    "split",
+    "explode"
+  ],
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "onLanguage:typescript",
+    "onLanguage:typescriptreact",
+    "onLanguage:javascript",
+    "onLanguage:javascriptreact"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "explodeDocument.run",
+        "title": "Explode Document",
+        "category": "Refactor"
+      }
+    ],
+    "submenus": [
+      {
+        "id": "explodeDocumentRefactorSubmenu",
+        "label": "Explode Document"
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "explodeDocument.run",
+          "when": "resourceExtname =~ /\\.(ts|tsx|js|jsx)$/"
+        }
+      ],
+      "editor/context": [
+        {
+          "submenu": "explodeDocumentRefactorSubmenu",
+          "group": "refactor@1",
+          "when": "editorTextFocus && !editorReadonly && resourceExtname =~ /\\.(ts|tsx|js|jsx)$/"
+        }
+      ],
+      "explodeDocumentRefactorSubmenu": [
+        {
+          "command": "explodeDocument.run",
+          "group": "1_modification",
+          "when": "editorTextFocus && !editorReadonly && resourceExtname =~ /\\.(ts|tsx|js|jsx)$/"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run build",
+    "build": "tsc -p ./",
+    "watch": "tsc -w -p ./",
+    "lint": "eslint src",
+    "test": "vscode-test"
+  },
+  "devDependencies": {
+    "@types/mocha": "^10.0.10",
+    "@types/node": "22.x",
+    "@types/vscode": "^1.105.0",
+    "@typescript-eslint/eslint-plugin": "^8.45.0",
+    "@typescript-eslint/parser": "^8.45.0",
+    "@vscode/test-cli": "^0.0.11",
+    "@vscode/test-electron": "^2.5.2",
+    "eslint": "^9.36.0",
+    "tslib": "^2.6.2",
+    "typescript": "^5.9.3"
+  }
+}
